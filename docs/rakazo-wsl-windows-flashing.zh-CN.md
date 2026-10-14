@@ -77,7 +77,7 @@ sudo systemctl enable --now docker
 sudo usermod -aG docker "$USER"
 ```
 
-`docker` 组成员可以控制 Docker 守护进程，权限等同于宿主机 root；只对可信用户授权。[Docker 安装后步骤](https://docs.docker.com/engine/install/linux-postinstall/)解释了这一权限边界。WSL 的 systemd 服务本身不会让发行版一直保持运行；Windows 重启或 WSL 关闭后，先启动 Ubuntu，再检查 `docker info` 和 Rakazo 服务。[WSL systemd 说明](https://learn.microsoft.com/en-us/windows/wsl/systemd/)
+`docker` 组成员可以控制 Docker 守护进程，权限等同于宿主机 root；只对可信用户授权。[Docker 安装后步骤](https://docs.docker.com/engine/install/linux-postinstall/)解释了这一权限边界。WSL 的 systemd 服务本身不会让发行版一直保持运行；Windows 重启或 WSL 关闭后，先启动 Ubuntu，再检查 `docker info` 和 Rakazo 服务。[WSL systemd 说明](https://learn.microsoft.com/en-us/windows/wsl/systemd/)需要发行版每次启动都自动恢复 Engine 与栈时，见下文「发行版启动时自动恢复 Engine 与 Rakazo 栈」。
 
 ### 两条路径共用的检查
 
@@ -91,6 +91,131 @@ docker info
 ```
 
 Rakazo 的本地 Docker 电脑需要 Docker Engine 26 或更新版本。若 Ubuntu 中无法运行 `docker info`，路径 A 检查 Docker Desktop 是否已启动、处于 Linux containers 模式并启用了 Ubuntu 集成；路径 B 检查 `systemctl status docker`、当前用户是否已重新登录并取得 `docker` 组权限。两条路径都不要求在 Ubuntu 中安装 Node.js 或 pnpm。
+
+### 发行版启动时自动恢复 Engine 与 Rakazo 栈
+
+路径 B 默认要求 `systemd=true`，由 `systemctl enable --now docker` 在发行版启动时拉起 Engine。若发行版有意保留 `systemd=false`（例如为配合 TUN 代理自行管理 DNS），`docker.service` 即使处于 enabled 状态也没有任何进程会执行它：每次启动发行版，Engine 和 Compose 栈都要手动拉起来。发行版本身也不会常驻，Windows 重启或 `wsl --shutdown` 后仍要先启动 Ubuntu。
+
+这种情况下把启动交给 WSL 的 boot command。把下面的脚本存成 `wsl-boot.sh`（`STACK_USER` 改成运行 `docker compose` 的 WSL 用户名），再以 `sudo install -m 755 wsl-boot.sh /usr/local/bin/wsl-boot.sh` 安装：
+
+```sh
+#!/bin/sh
+# 由 /etc/wsl.conf 的 [boot] command 在发行版启动时以 root 运行。
+set -u
+
+LOG=/var/log/rakazo-boot.log
+STACK_USER=ubuntu
+
+# 工作分离到后台，boot command 立即返回，终端不会被拖住。
+if [ "${1:-}" != "--detached" ]; then
+  setsid "$0" --detached </dev/null >>"$LOG" 2>&1 &
+  exit 0
+fi
+
+log() { echo "[$(date -Is)] $*"; }
+
+if ! pgrep -x dockerd >/dev/null 2>&1; then
+  log "starting dockerd"
+  nohup /usr/bin/dockerd -p /var/run/docker.pid >>"$LOG" 2>&1 &
+fi
+
+waited=0
+while [ ! -S /var/run/docker.sock ] && [ "$waited" -lt 90 ]; do
+  sleep 1
+  waited=$((waited + 1))
+done
+if [ ! -S /var/run/docker.sock ]; then
+  log "docker socket did not appear within ${waited}s"
+  exit 1
+fi
+log "docker socket ready after ${waited}s"
+
+# 若模型连接需要经代理，在这里为 su 的命令导出 HTTP_PROXY/HTTPS_PROXY/NO_PROXY
+# （Compose 会读取这些变量），NO_PROXY 必须包含内部服务名与 172.17.0.0/16。
+HOME_DIR=$(getent passwd "$STACK_USER" | cut -d: -f6)
+COMPOSE_DIR="$HOME_DIR/rakazo/infra/compose"
+
+su - "$STACK_USER" -c "cd $COMPOSE_DIR && docker compose --env-file .env -f docker-compose.yml up -d" >>"$LOG" 2>&1
+log "compose up exited $?"
+```
+
+再在 `/etc/wsl.conf` 的 `[boot]` 段加入一行 `command`（该段原本可能已有 `systemd=false`）：
+
+```ini
+[boot]
+systemd=false
+command = /usr/local/bin/wsl-boot.sh
+```
+
+脚本用与手动流程相同的命令行拉起 `dockerd`（读同一份 `/etc/docker/daemon.json`），等 API socket 就绪后，以 `STACK_USER` 的身份在源码目录执行 `docker compose up -d`；重复执行是幂等的。日志在 `/var/log/rakazo-boot.log`，出错先看这里。
+
+不重启也能先验证脚本本身：
+
+```bash
+sudo /usr/local/bin/wsl-boot.sh
+tail -5 /var/log/rakazo-boot.log
+```
+
+真正的验证是重启发行版：在 Windows PowerShell 执行 `wsl --shutdown`，重新打开 Ubuntu，等几秒后 `docker ps` 应能看到五个服务容器。`compose-computer` 与 `compose-data-init` 显示为 Exited 属于正常，两者执行完即退出；Bot 的电脑容器由 Supervisor 按需创建。
+
+boot command 只在发行版启动时触发，所以 Windows 重启后仍需先打开一次 Ubuntu 终端。要完全自动，在 Windows 侧加一个登录时运行 `wsl -d Ubuntu-24.04 true` 的计划任务即可。取消自启则删除 `/etc/wsl.conf` 中的 `command` 行。
+
+### 限制 WSL 的内存与交换文件（Windows 侧 `.wslconfig`）
+
+WSL 2 的虚拟机默认最多占用宿主内存的一半（任务管理器里的 `vmmem` 进程）。完整 Compose 栈会同时运行 PostgreSQL、API、Worker、Web 和 Bot 电脑容器，内存占用容易顶到上限；宿主可用内存吃紧后，Windows 的系统托管页面文件（`C:\pagefile.sys`）会频繁换页并随压力逐步增大（增长后不重启不会自动缩回），表现为「运行 WSL 时 C 盘吃紧」。用 `%UserProfile%\.wslconfig` 给 WSL 设置上限；该文件在 Windows 侧，修改后要在 PowerShell 运行 `wsl --shutdown`、重新打开发行版才生效。[微软的 WSL 配置文档](https://learn.microsoft.com/en-us/windows/wsl/wsl-config)列出了全部选项。
+
+```ini
+[wsl2]
+# 内存上限取物理内存的一半左右，给 Windows 和桌面程序留余量
+memory=8GB
+
+# 保留 1-2 个核心给 Windows
+processors=4
+
+# 交换文件放非系统盘，避免把 C 盘撑大；路径按实际部署调整
+swap=8GB
+swapfile=D:\\WSL\\Ubuntu-24.04\\swap.vhdx
+
+# 可选：较新的 WSL 可把发行版长期不用的内存逐步交还 Windows
+# （先确认 WSL 版本支持；不确定就保持注释）
+# [experimental]
+# autoMemoryReclaim=gradual
+```
+
+内存上限不宜超过物理内存的 70%，也不宜低于栈实际使用的峰值；观察方式是 Windows 任务管理器看 `vmmem`、发行版内看 `free -h`。不设置 `swapfile` 时，交换文件默认落在 C 盘的用户临时目录，这也是「运行 WSL 时 C 盘吃紧」的常见来源之一。
+
+### 回收发行版虚拟磁盘占用的空间
+
+WSL 2 的发行版磁盘是动态扩展的虚拟磁盘（`ext4.vhdx`），**只增不减**：在发行版里删除文件、或清理 Docker 镜像与构建缓存（如 `docker builder prune`）之后，Windows 侧的文件不会自动变小，发行版磁盘可能远大于 Linux 内部的真实占用。两种回收方式，执行前都先在 PowerShell 运行 `wsl --shutdown`（期间栈停止，重新打开 Ubuntu 后会按第 2 节的方式自动恢复）；已有业务数据的部署先做一次备份（见[自托管指南的备份小节](./self-host.md#backup)）。
+
+**方式一：设为稀疏磁盘（WSL 2.0 起支持，一次设置持续生效）**
+
+```powershell
+wsl --shutdown
+wsl --manage Ubuntu-24.04 --set-sparse true
+```
+
+之后磁盘空间按需自动回收，无需再手动压缩；需要改回普通磁盘用 `--set-sparse false`。若之后遇到磁盘写入性能问题，可以改回。
+
+**方式二：手动压缩（旧版 WSL 或需要一次性彻底回收）**
+
+先 `wsl --shutdown`，然后打开磁盘管理工具：
+
+```powershell
+diskpart
+```
+
+在 diskpart 提示符下依次执行（路径按实际部署调整；磁盘文件位置见下文）：
+
+```text
+select vdisk file="D:\WSL\Ubuntu-24.04\ext4.vhdx"
+attach vdisk readonly
+compact vdisk
+detach vdisk
+exit
+```
+
+`ext4.vhdx` 的位置取决于发行版的安装方式：`wsl --install` 安装的发行版在 `%LOCALAPPDATA%\Packages\<发行版包名>\LocalState\`，`wsl --import` 导入的发行版在导入时指定的目录（本教程第 8 节）。建议在清理镜像和构建缓存之后做一次。日常空间紧张时，也可以把整个发行版移到非系统盘：`wsl --manage Ubuntu-24.04 --move D:\WSL\Ubuntu-24.04`（同样先 `wsl --shutdown`）。[微软的命令说明](https://learn.microsoft.com/en-us/windows/wsl/basic-commands/)涵盖 `--manage` 的各个选项。
 
 ## 3. 在 WSL 中准备源码与 `.env`
 
