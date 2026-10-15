@@ -157,6 +157,61 @@ flowchart TB
 
 Hono 提供 API HTTP 服务，oRPC 和共享 schema 连接客户端与服务端；Prisma 访问 PostgreSQL；Graphile 消费后台任务；Pi 对接模型和工具循环。具体版本以包清单及锁文件为准。
 
+### 3.1 目录与入口文件索引
+
+#### 前端
+
+| 部分 | 目录与入口 | 职责 |
+| --- | --- | --- |
+| Web 启动 | [apps/web/src/main.tsx](../apps/web/src/main.tsx) | 挂载 React，初始化路由、国际化与外观等全局 Provider |
+| Web 页面路由 | [apps/web/src/App.tsx](../apps/web/src/App.tsx) | 登录状态、访问入口与页面路由 |
+| Web 主工作区 | [apps/web/src/pages/Shell.tsx](../apps/web/src/pages/Shell.tsx) | 组织聊天等核心界面 |
+| Web API 客户端 | [apps/web/src/lib/rpc.ts](../apps/web/src/lib/rpc.ts) | 根据共享契约创建 oRPC 客户端 |
+| Electron | [apps/desktop/src/main.ts](../apps/desktop/src/main.ts) | 创建窗口、承载 Web UI，并处理系统集成；本地服务栈由 [local-stack.ts](../apps/desktop/src/local-stack.ts) 管理 |
+| 移动端 | [apps/mobile/app/_layout.tsx](../apps/mobile/app/_layout.tsx) | Expo Router 根布局；启动入口在包清单中声明为 `expo-router/entry`，具体页面位于 `apps/mobile/app/` |
+| 营销站 | [apps/www/src/pages](../apps/www/src/pages) | 独立的 Astro 网站 |
+
+跨端聊天界面位于 `packages/chat-ui`，Web 通用组件位于 `packages/ui-web`，共享设计令牌位于 `packages/ui-tokens`。移动端保留原生导航、存储、权限和交互。
+
+#### 后端
+
+| 入口 | 职责 |
+| --- | --- |
+| [apps/api/src/index.ts](../apps/api/src/index.ts) | 加载配置，调用 `createApp()`，启动 HTTP 服务并处理进程退出 |
+| [apps/api/src/app.ts](../apps/api/src/app.ts) | 装配数据库、认证、执行器和适配器，挂载 Hono 与 oRPC 等路由 |
+| [apps/api/src/router.ts](../apps/api/src/router.ts) | `createRouter()` 实现聊天、Bot、Computer、例行任务和事件订阅等业务接口 |
+| [apps/worker/src/index.ts](../apps/worker/src/index.ts) | 装配运行时、沙盒与任务处理器，启动后台作业消费和恢复协调器 |
+| [packages/contracts/src/rpc.ts](../packages/contracts/src/rpc.ts) | 定义客户端与服务端共享的 RPC 契约 |
+| [packages/db/prisma/schema.prisma](../packages/db/prisma/schema.prisma) | 定义业务数据模型 |
+
+#### Agent 执行
+
+执行实现集中在 `packages/adapters/src/`，由 API 和 Worker 入口组装复用。
+
+| 文件 | 职责 |
+| --- | --- |
+| [background-job-handlers.ts](../packages/adapters/src/background-job-handlers.ts) | 将 `run.continue` 作业分发到 `executor.continueRun()`，并处理例行任务唤醒等后台工作 |
+| [executor.ts](../packages/adapters/src/executor.ts) | `createRunExecutor()` 管理运行租约、上下文、工具、审批、状态与结果持久化等编排 |
+| [pi-runtime.ts](../packages/adapters/src/pi-runtime.ts) | `PiAgentRuntime` 实现 `AgentRuntime` 接口，驱动模型与工具调用循环 |
+| [job-reconciler.ts](../packages/adapters/src/job-reconciler.ts) | 根据持久化状态协调任务恢复 |
+| [interfaces.ts](../packages/adapter-kit/src/interfaces.ts) | 定义 `AgentRuntime`、`SandboxProvider` 等外部能力接口 |
+
+默认路径中，模型与工具循环运行在 Worker 进程内；命令、文件和电脑操作通过沙盒接口执行。执行器连接这两个边界。
+
+#### 沙盒管理
+
+| 层次 | 目录与入口 | 职责 |
+| --- | --- | --- |
+| 装配与宿主机路由 | [packages/adapters/src/host-aware-sandbox.ts](../packages/adapters/src/host-aware-sandbox.ts) | `createRunSandbox()` 装配沙盒并处理宿主机路由 |
+| 提供商选择 | [packages/adapters/src/sandbox-factory.ts](../packages/adapters/src/sandbox-factory.ts) | 选择 Docker、桌面、远程服务或测试实现 |
+| Docker 适配 | [packages/adapters/src/docker-sandbox.ts](../packages/adapters/src/docker-sandbox.ts) | 将统一沙盒操作转换为 Supervisor 请求 |
+| Docker 管理服务 | [infra/sandboxes/supervisor/src/index.ts](../infra/sandboxes/supervisor/src/index.ts) | 独立 HTTP 服务，使用 Docker API 管理电脑容器及操作 |
+| 容器配置 | [infra/sandboxes/supervisor/src/computer-spec.ts](../infra/sandboxes/supervisor/src/computer-spec.ts) | 定义容器、网络、存储和资源限制配置 |
+| 电脑镜像与启动 | [infra/sandboxes/computer/Dockerfile](../infra/sandboxes/computer/Dockerfile)、[start.sh](../infra/sandboxes/computer/start.sh) | 构建并启动实际电脑环境 |
+| 容器内控制 | [infra/sandboxes/computer/control.py](../infra/sandboxes/computer/control.py) | 提供电脑容器内部的控制能力 |
+
+追踪一次请求时，可按以下顺序阅读：`main.tsx` → Web RPC 客户端 → API `router.ts` → `worker/src/index.ts` → `background-job-handlers.ts` → `executor.ts` → `pi-runtime.ts` 或 `docker-sandbox.ts` → Supervisor。模型推理和工具执行会多次往返，具体过程见下一节。
+
 ## 4. 一次任务如何执行
 
 ### 4.1 从消息到运行
