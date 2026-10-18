@@ -25,7 +25,7 @@ lsof -nP -iTCP:3100 -iTCP:5173 -iTCP:5433 -iTCP:7091 -sTCP:LISTEN
 
 - [x] 使用 Docker 运行时启动 Colima，初始分配 4 核 CPU、4 GiB 内存和 100 GiB 虚拟磁盘。这里的内存是虚拟机额度，不是 PostgreSQL 的固定消耗；多个机器人电脑同时运行或出现内存不足时，再评估增至 6–8 GiB。确认 Docker context 指向 Colima，且 `docker info` 成功。
 - [x] 仅在 `.env` 不存在时复制 `.env.example`。为 `POSTGRES_PASSWORD`、`BETTER_AUTH_SECRET`、`ENCRYPTION_KEY`、`SCREEN_PROXY_SECRET` 和 `SANDBOX_SUPERVISOR_TOKEN` 分别生成随机值；数据库密码也写入 `DATABASE_URL`。不要显示或提交密钥。
-- [x] 保持 `API_HOST`、`BETTER_AUTH_URL`、`WEB_ORIGIN` 为本机回环地址。设置 `SANDBOX_PROVIDER=docker`、`SANDBOX_CONTROL_VIA_LOOPBACK=true`，并把 Colima Docker socket URL 写入 `DOCKER_HOST`。本阶段无需模型密钥。
+- [x] 保持 `API_HOST`、`BETTER_AUTH_URL`、`WEB_ORIGIN` 为本机回环地址，设置 `SANDBOX_PROVIDER=docker`。使用 `scripts/local-mac.sh start` 时，脚本自动读取 Colima 的 Docker socket URL，向 Supervisor 注入 `DOCKER_HOST` 和 `SANDBOX_CONTROL_VIA_LOOPBACK=true`，无需手动写入 `.env`。直接运行 Supervisor 时仍需自行设置这两个变量。本阶段无需模型密钥。
 - [x] 使用本机端口覆盖文件启动 PostgreSQL，等待健康检查完成。默认仅在 `127.0.0.1:5433` 发布端口。
 
 ```bash
@@ -40,6 +40,8 @@ docker compose --env-file .env \
 ```
 
 已有 Colima 配置时先检查，再调整 CPU 和内存。数据库卷已存在时，`.env` 必须沿用原有数据库凭据；不要通过删除卷来解决登录失败。
+
+以上 Docker 命令用于首次准备与排查。完成依赖安装和镜像构建后，日常启动交给 `scripts/local-mac.sh start`，无需逐条重复。
 
 ## 第三阶段：安装、构建并启动源码服务
 
@@ -79,7 +81,11 @@ corepack pnpm sandbox:build
 ./scripts/local-mac.sh stop
 ```
 
-脚本仅为当前登录会话加载服务，不在下次登录时自动启动。停止时只停止当前仓库的机器人电脑容器；若 Colima 原本已在运行或有其他容器仍在运行，脚本会保留 Colima。服务日志写入 `~/.local/state/rakazo/logs`。
+脚本仅为当前登录会话加载服务，不在下次登录时自动启动。`start` 按需启动 Colima（已有配置保留，首次使用 4 核、4 GiB 内存和 100 GiB 磁盘），验证 Docker 连接，启动 PostgreSQL 和四个服务，并检查 Supervisor、API 和 Web。它不会覆盖 `.env` 或自动安装依赖、运行迁移和构建镜像。
+
+`stop` 停止服务、当前仓库的机器人电脑容器和 PostgreSQL，保留数据；没有其他运行中容器时一并关闭 Colima，即使 Colima 最初由你手动启动。如果其他容器仍在运行，则保留 Colima。服务日志写入 `~/.local/state/rakazo/logs`。
+
+重复 `start` 通常不会重启已加载服务；如果 Supervisor 的已保存配置缺少 `DOCKER_HOST` 或地址变化，会重新加载 Supervisor。修改其他 `.env` 配置或升级源码后仍应先 `stop` 再 `start`。
 
 升级时先手动停止，再在当前仓库安装依赖、运行迁移和构建。完成后手动启动：
 

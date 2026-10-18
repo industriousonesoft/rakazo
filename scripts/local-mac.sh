@@ -9,13 +9,24 @@ root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 state_dir="${HOME}/.local/state/rakazo/manual"
 agent_dir="${state_dir}/agents"
 log_dir="${HOME}/.local/state/rakazo/logs"
-# 标记 Colima 是否由本脚本启动，供停止时判断是否可以一并关闭。
-colima_marker="${state_dir}/started-colima"
 domain="gui/$(id -u)"
 services=(supervisor api worker web)
 
 # 后续 Docker 命令统一连接 Colima，避免操作其他 Docker 环境。
 export DOCKER_CONTEXT=colima
+
+# Docker SDK 不读取 CLI context；显式把同一地址传给 Supervisor。
+configure_docker() {
+  local endpoint
+  endpoint="$(docker context inspect colima --format '{{.Endpoints.docker.Host}}')"
+  case "${endpoint}" in
+    unix:///*) ;;
+    *) echo 'Colima must expose a local Unix Docker socket.' >&2; return 1 ;;
+  esac
+  export DOCKER_HOST="${endpoint}"
+  # 不依赖 CLI context 验证地址，确保 Supervisor 将使用的连接也可用。
+  env -u DOCKER_CONTEXT docker --host "${DOCKER_HOST}" info >/dev/null
+}
 
 # 输出可用子命令；参数缺失或无效时以退出码 2 结束。
 usage() {
@@ -68,11 +79,17 @@ commands = {
 }
 for name, command in commands.items():
     label = f"local.rakazo.{name}"
+    environment = {"PATH": path}
+    if name == "supervisor":
+        environment.update({
+            "DOCKER_HOST": os.environ["DOCKER_HOST"],
+            "SANDBOX_CONTROL_VIA_LOOPBACK": "true",
+        })
     config = {
         "Label": label,
         "ProgramArguments": command,
         "WorkingDirectory": str(root),
-        "EnvironmentVariables": {"PATH": path},
+        "EnvironmentVariables": environment,
         # 手动加载后立即启动，进程退出后自动拉起；stop 会卸载这些任务。
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -88,7 +105,7 @@ PY
 }
 
 # 检查配置、依赖和构建产物，按需启动 Colima、数据库及四个本机服务。
-# 跳过已注册的 launchd 服务，因此再次执行 start 不等于重启或重新加载配置。
+# 跳过已注册的服务；Docker 地址变化时重新加载 Supervisor。
 # 最后探测 API 和 Web；失败返回非零，不自动回滚此前已启动的组件。
 start() {
   [[ -f "${root_dir}/.env" ]] || { echo 'Missing .env in the repository root.' >&2; return 1; }
@@ -96,21 +113,32 @@ start() {
   [[ -f "${root_dir}/apps/web/dist/index.html" ]] || { echo 'Build the web app before starting.' >&2; return 1; }
   command -v docker >/dev/null || { echo 'Docker CLI is unavailable.' >&2; return 1; }
   command -v colima >/dev/null || { echo 'Colima is unavailable.' >&2; return 1; }
+  command -v python3 >/dev/null || { echo 'Python 3 is unavailable.' >&2; return 1; }
+  command -v pnpm >/dev/null || { echo 'pnpm is unavailable; enable Corepack and retry.' >&2; return 1; }
   umask 077
   mkdir -p "${agent_dir}" "${log_dir}"
 
   if ! colima status >/dev/null 2>&1; then
-    # 使用 macOS 虚拟化框架，配置 4 核 CPU、4 GiB 内存和 100 GiB 虚拟磁盘。
-    colima start --runtime docker --vm-type vz --cpu 4 --memory 4 --disk 100
-    touch "${colima_marker}"
+    if [[ -f "${COLIMA_HOME:-${HOME}/.colima}/default/colima.yaml" ]]; then
+      # 保留现有 CPU、内存和磁盘设置。
+      colima start
+    else
+      colima start --runtime docker --vm-type vz --cpu 4 --memory 4 --disk 100
+    fi
   fi
-  docker info >/dev/null
+  configure_docker
   compose up postgres -d --wait
   docker image inspect rakazo/computer:local >/dev/null || {
     echo 'Build the bot computer image with pnpm sandbox:build before starting.' >&2
     return 1
   }
 
+  local previous_host
+  previous_host="$(plutil -extract EnvironmentVariables.DOCKER_HOST raw -o - \
+    "${agent_dir}/local.rakazo.supervisor.plist" 2>/dev/null || true)"
+  if agent_loaded supervisor && [[ "${previous_host}" != "${DOCKER_HOST}" ]]; then
+    launchctl bootout "${domain}" "${agent_dir}/local.rakazo.supervisor.plist"
+  fi
   write_agents
   local name
   for name in "${services[@]}"; do
@@ -119,11 +147,12 @@ start() {
     fi
   done
 
-  # 最多探测 45 轮，失败后间隔 1 秒；curl 未设超时，总耗时可能超过 45 秒。
+  # 同时确认 Supervisor 已监听；每次探测设置超时。
   local attempt
   for attempt in {1..45}; do
-    if curl -fsS http://127.0.0.1:3100/internal/health >/dev/null 2>&1 &&
-       curl -fsS http://127.0.0.1:5173/ >/dev/null 2>&1; then
+    if curl --max-time 2 -fsS http://127.0.0.1:7091/health >/dev/null 2>&1 &&
+       curl --max-time 2 -fsS http://127.0.0.1:3100/internal/health >/dev/null 2>&1 &&
+       curl --max-time 2 -fsS http://127.0.0.1:5173/ >/dev/null 2>&1; then
       echo 'Rakazo is ready at http://127.0.0.1:5173'
       return 0
     fi
@@ -147,7 +176,7 @@ stop_owned_computers() {
 }
 
 # 依次卸载 Web、Worker、API、Supervisor，再停止当前仓库的电脑容器和数据库。
-# 只有存在本脚本的启动标记、且没有任何运行中容器时，才一并关闭 Colima。
+# 没有其他运行中容器时一并关闭 Colima，无论最初由谁启动。
 # 保留 PostgreSQL 数据卷、机器人文件及日志，方便下次启动继续使用。
 stop() {
   local name
@@ -159,13 +188,12 @@ stop() {
   if colima status >/dev/null 2>&1; then
     stop_owned_computers
     compose stop postgres
-    if [[ -f "${colima_marker}" ]]; then
-      if [[ -z "$(docker ps -q)" ]]; then
-        colima stop
-        rm -f "${colima_marker}"
-      else
-        echo 'Colima remains running because other containers are active.'
-      fi
+    local running_containers
+    running_containers="$(docker ps -q)"
+    if [[ -z "${running_containers}" ]]; then
+      colima stop
+    else
+      echo 'Colima remains running because other containers are active.'
     fi
   fi
   echo 'Rakazo stopped; PostgreSQL data and bot homes were retained.'
